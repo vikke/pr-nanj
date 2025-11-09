@@ -671,30 +671,30 @@ def main():
 ■ 直近のPR取得
 
   # 直近100件のマージ済みPRを取得
-  gh pr list --repo username/reponame --state merged --limit 100 \\
+  gh pr list --state merged --limit 100 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_100.json
 
   # 直近500件
-  gh pr list --repo username/reponame --state merged --limit 500 \\
+  gh pr list --state merged --limit 500 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_500.json
 
   # 直近1000件（上限に注意）
-  gh pr list --repo username/reponame --state merged --limit 1000 \\
+  gh pr list --state merged --limit 1000 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_1000.json
 
 ■ 年度別のPR取得
 
   # 2025年のPR
-  gh pr list --repo username/reponame --state merged --limit 1000 \\
+  gh pr list --state merged --limit 1000 \\
     --search "merged:2025-01-01..2025-12-31" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2025.json
 
   # 2024年のPR
-  gh pr list --repo username/reponame --state merged --limit 1000 \\
+  gh pr list --state merged --limit 1000 \\
     --search "merged:2024-01-01..2024-12-31" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024.json
@@ -702,25 +702,25 @@ def main():
 ■ 四半期別のPR取得
 
   # 2024年Q4（10-12月）
-  gh pr list --repo username/reponame --state merged --limit 500 \\
+  gh pr list --state merged --limit 500 \\
     --search "merged:2024-10-01..2024-12-31" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q4.json
 
   # 2024年Q3（7-9月）
-  gh pr list --repo username/reponame --state merged --limit 500 \\
+  gh pr list --state merged --limit 500 \\
     --search "merged:2024-07-01..2024-09-30" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q3.json
 
   # 2024年Q2（4-6月）
-  gh pr list --repo username/reponame --state merged --limit 500 \\
+  gh pr list --state merged --limit 500 \\
     --search "merged:2024-04-01..2024-06-30" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q2.json
 
   # 2024年Q1（1-3月）
-  gh pr list --repo username/reponame --state merged --limit 500 \\
+  gh pr list --state merged --limit 500 \\
     --search "merged:2024-01-01..2024-03-31" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q1.json
@@ -730,16 +730,16 @@ def main():
   大量のPRを取得する場合、APIの制限により分割して取得する必要があります：
 
   # 期間を分けて取得
-  gh pr list --repo username/reponame --state merged --limit 400 \\
+  gh pr list --state merged --limit 400 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part1.json
 
-  gh pr list --repo username/reponame --state merged --limit 400 \\
+  gh pr list --state merged --limit 400 \\
     --search "merged:<=2024-06-30" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part2.json
 
-  gh pr list --repo username/reponame --state merged --limit 400 \\
+  gh pr list --state merged --limit 400 \\
     --search "merged:<=2024-01-01" \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part3.json
@@ -753,12 +753,12 @@ def main():
 ■ 特定条件でのPR取得
 
   # 特定の作者のPR
-  gh pr list --repo username/reponame --state merged --author username --limit 100 \\
+  gh pr list --state merged --author username --limit 100 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_username.json
 
   # 特定のラベルを持つPR
-  gh pr list --repo username/reponame --state merged --label "bug" --limit 100 \\
+  gh pr list --state merged --label "bug" --limit 100 \\
     --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_bugs.json
 
