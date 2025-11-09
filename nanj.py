@@ -8,17 +8,22 @@ import json
 import sys
 import argparse
 import os
+import subprocess
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class NanJLineup:
     """なんJ風PR打線を生成するクラス"""
 
-    def __init__(self, repo: str = "username/reponame"):
+    def __init__(self, repo: str = "username/reponame", use_claude: bool = True, include_merge_prs: bool = False):
         self.repo = repo
         self.all_prs = []
         self.sorted_prs = []
+        self.use_claude = use_claude
+        self.include_merge_prs = include_merge_prs
+        self.catchphrases = {}  # position -> catchphrase
         self.categories = {
             'small_fixes': [],
             'bug_fixes': [],
@@ -29,6 +34,42 @@ class NanJLineup:
             'huge_prs': [],
             'merge_prs': []
         }
+
+    def is_merge_pr(self, pr: Dict[str, Any]) -> bool:
+        """マージPR（リリース、integration等）かどうか判定"""
+        base_ref = pr.get('baseRefName', '')
+        head_ref = pr.get('headRefName', '')
+
+        # main/master へのマージ（リリースPR）
+        if base_ref in ['main', 'master', 'develop']:
+            return True
+
+        return False
+
+    def extract_repo_from_prs(self, prs: List[Dict[str, Any]]) -> Optional[str]:
+        """PRデータからリポジトリ名を抽出"""
+        for pr in prs:
+            # headRepository と headRepositoryOwner から抽出
+            head_repo = pr.get('headRepository')
+            head_owner = pr.get('headRepositoryOwner')
+
+            if head_repo and head_owner:
+                repo_name = head_repo.get('name')
+                owner_login = head_owner.get('login')
+
+                if repo_name and owner_login:
+                    return f"{owner_login}/{repo_name}"
+
+            # 旧形式: headRepository.owner.login も試す
+            if head_repo and isinstance(head_repo, dict):
+                repo_name = head_repo.get('name')
+                owner = head_repo.get('owner', {})
+                owner_login = owner.get('login') if isinstance(owner, dict) else None
+
+                if repo_name and owner_login:
+                    return f"{owner_login}/{repo_name}"
+
+        return None
 
     def load_prs_from_file(self, filepath: str) -> None:
         """JSONファイルからPRデータを読み込む"""
@@ -43,9 +84,35 @@ class NanJLineup:
                 prs = [prs]
 
             # マージ済みのみフィルタ（mergedAtがあるものだけ）
-            self.all_prs = [pr for pr in prs if pr.get('mergedAt')]
+            merged_prs = [pr for pr in prs if pr.get('mergedAt')]
 
-            print(f"✨ 合計 {len(self.all_prs)} 件のマージ済みPRを読み込み完了！", file=sys.stderr)
+            # マージPRのフィルタリング
+            if not self.include_merge_prs:
+                filtered_count = 0
+                filtered_prs = []
+                for pr in merged_prs:
+                    if self.is_merge_pr(pr):
+                        filtered_count += 1
+                    else:
+                        filtered_prs.append(pr)
+                self.all_prs = filtered_prs
+
+                if filtered_count > 0:
+                    print(f"🔧 マージPR（リリース・integration等）を {filtered_count} 件除外しました", file=sys.stderr)
+            else:
+                self.all_prs = merged_prs
+
+            print(f"✨ 合計 {len(self.all_prs)} 件のPRを読み込み完了！", file=sys.stderr)
+
+            # リポジトリ名が未設定の場合、PRデータから抽出
+            if self.repo == "username/reponame":
+                extracted_repo = self.extract_repo_from_prs(self.all_prs)
+                if extracted_repo:
+                    self.repo = extracted_repo
+                    print(f"🔍 リポジトリ名を自動検出: {self.repo}", file=sys.stderr)
+                else:
+                    print(f"⚠️  リポジトリ名を自動検出できませんでした。デフォルト '{self.repo}' を使用します。", file=sys.stderr)
+                    print(f"   ヒント: gh pr list に --json オプションで headRepository,headRepositoryOwner を含めてください", file=sys.stderr)
 
         except FileNotFoundError:
             print(f"❌ エラー: ファイル '{filepath}' が見つかりません", file=sys.stderr)
@@ -117,6 +184,99 @@ class NanJLineup:
     def format_pr_link(self, pr: Dict[str, Any]) -> str:
         """PR番号とURLをマークダウン形式でフォーマット"""
         return f"[PR-{pr['number']}](https://github.com/{self.repo}/pull/{pr['number']})"
+
+    def generate_single_catchphrase(self, position: int, pr: Dict[str, Any]) -> str:
+        """Claude CLIを使って1人分のキャッチフレーズを生成"""
+        position_desc = {
+            1: "1番・二塁手（俊足巧打、出塁率が高い）",
+            2: "2番・遊撃手（バント・守備の職人）",
+            3: "3番・右翼手（中距離砲、チャンスに強い）",
+            4: "4番・一塁手（最強の破壊力、本塁打王）",
+            5: "5番・左翼手（4番に次ぐパワー）",
+            6: "6番・三塁手（つなぎの役割、得点圏打率が高い）",
+            7: "7番・捕手（守備重視、地味だが堅実）",
+            8: "8番・中堅手（下位打線、期待値低め）",
+            9: "9番・投手（最弱打者、でも投手だから...）"
+        }
+
+        total_lines = pr.get('additions', 0) + pr.get('deletions', 0)
+
+        prompt = f"""以下のPR情報から、野球のなんJ風の一言キャッチフレーズを生成してください。
+
+【PR情報】
+- ポジション: {position_desc.get(position, f'{position}番')}
+- PRタイトル: {pr['title']}
+- 追加行数: {pr.get('additions', 0)}行
+- 削除行数: {pr.get('deletions', 0)}行
+- 合計変更: {total_lines}行
+- 変更ファイル数: {pr.get('changedFiles', 0)}ファイル
+
+【生成条件】
+1. なんJ（2ちゃんねる野球板）風の言い回しで
+2. PRの内容とポジションの特性を反映
+3. 15文字以内で簡潔に
+4. 「〜男」「〜の鬼」「〜やんけ」等のなんJ用語を使う
+5. キャッチフレーズのみ出力（説明不要）
+
+【出力例】
+エラーを見たら黙ってない男
+{total_lines}行で世界を変える男
+圧倒的破壊力、リポジトリの四番打者
+
+【出力】
+"""
+
+        try:
+            result = subprocess.run(
+                ['claude', '--print', '--output-format', 'text'],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode != 0:
+                print(f"⚠️  {position}番のClaude呼び出しエラー: {result.stderr}", file=sys.stderr)
+                return f"PR-{pr['number']}の選手"
+
+            catchphrase = result.stdout.strip()
+            # 余計な装飾を削除
+            catchphrase = catchphrase.replace('**「', '').replace('」**', '')
+            catchphrase = catchphrase.replace('「', '').replace('」', '')
+            catchphrase = catchphrase.replace('**', '')
+            catchphrase = catchphrase.strip('"\'')
+
+            # 空の場合はデフォルト
+            if not catchphrase:
+                return f"PR-{pr['number']}の選手"
+
+            return catchphrase
+        except subprocess.TimeoutExpired:
+            print(f"⚠️  {position}番のキャッチフレーズ生成がタイムアウト", file=sys.stderr)
+            return f"PR-{pr['number']}の選手"
+        except Exception as e:
+            print(f"⚠️  {position}番のキャッチフレーズ生成に失敗: {e}", file=sys.stderr)
+            return f"PR-{pr['number']}の選手"
+
+    def generate_all_catchphrases(self, lineup_data: Dict[int, Dict[str, Any]]) -> None:
+        """9人分のキャッチフレーズを並列生成"""
+        print("🤖 Claude CLIでキャッチフレーズを並列生成中...", file=sys.stderr)
+
+        with ThreadPoolExecutor(max_workers=9) as executor:
+            future_to_position = {
+                executor.submit(self.generate_single_catchphrase, position, pr): position
+                for position, pr in lineup_data.items()
+            }
+
+            for future in as_completed(future_to_position):
+                position = future_to_position[future]
+                try:
+                    catchphrase = future.result()
+                    self.catchphrases[position] = catchphrase
+                    print(f"  ✓ {position}番: {catchphrase}", file=sys.stderr)
+                except Exception as e:
+                    print(f"  ✗ {position}番: 生成失敗 - {e}", file=sys.stderr)
+                    self.catchphrases[position] = f"PR選手{position}番"
 
     def calculate_stats(self, pr: Dict[str, Any], position: int = 5) -> Dict[str, Any]:
         """PRデータから野球の成績を算出"""
@@ -209,8 +369,70 @@ class NanJLineup:
             'era': round(era, 2)
         }
 
+    def prepare_lineup_data(self) -> Dict[int, Dict[str, Any]]:
+        """打順を決定し、PR情報を返す"""
+        lineup = {}
+
+        # 1番: 軽いけど仕事するPR
+        lineup[1] = self.find_pr_by_criteria(
+            lambda pr: pr['weight'] < 20 and 'fix' in pr['title'].lower(),
+            fallback_index=-10
+        )
+
+        # 2番: バグ修正職人
+        lineup[2] = next(
+            (pr for pr in self.categories['bug_fixes'] if pr['weight'] < 500),
+            self.categories['bug_fixes'][0] if self.categories['bug_fixes']
+            else self.sorted_prs[min(100, len(self.sorted_prs) - 1)]
+        )
+
+        # 3番: UI系や大型機能
+        lineup[3] = self.find_pr_by_criteria(
+            lambda pr: '直感' in pr['title'] or 'ui' in pr['title'].lower(),
+            fallback_index=5
+        )
+
+        # 4番: 最大のPR
+        lineup[4] = self.sorted_prs[0]
+
+        # 5番: 2番目に大きいPR
+        lineup[5] = self.sorted_prs[1] if len(self.sorted_prs) > 1 else self.sorted_prs[0]
+
+        # 6番: マージ職人
+        if self.categories['merge_prs']:
+            lineup[6] = self.categories['merge_prs'][0]
+        else:
+            lineup[6] = self.sorted_prs[10] if len(self.sorted_prs) > 10 else self.sorted_prs[0]
+
+        # 7番: 地味な改善
+        lineup[7] = self.find_pr_by_criteria(
+            lambda pr: ('update' in pr['title'].lower() or 'improve' in pr['title'].lower())
+                      and 50 <= self.sorted_prs.index(pr) < 150,
+            fallback_index=75
+        )
+
+        # 8番: Bot枠
+        if self.categories['devin_prs']:
+            lineup[8] = self.categories['devin_prs'][0]
+        elif self.categories['bot_prs']:
+            lineup[8] = self.categories['bot_prs'][0]
+        else:
+            lineup[8] = self.sorted_prs[-5] if len(self.sorted_prs) > 5 else self.sorted_prs[0]
+
+        # 9番: 最弱PR
+        lineup[9] = self.sorted_prs[-1]
+
+        return lineup
+
     def generate_lineup(self) -> str:
         """なんJ風打線を生成"""
+        # 打順を決定
+        lineup_data = self.prepare_lineup_data()
+
+        # Claude CLIでキャッチフレーズを生成
+        if self.use_claude:
+            self.generate_all_catchphrases(lineup_data)
+
         output = []
         output.append("## 【悲報】{}リポジトリ、とんでもない打順を組んでしまうｗｗｗｗｗ".format(
             self.repo.split('/')[-1]
@@ -220,93 +442,80 @@ class NanJLineup:
         ))
 
         # 1番: 軽いけど仕事するPR
-        one_liner = self.find_pr_by_criteria(
-            lambda pr: pr['weight'] < 20 and 'fix' in pr['title'].lower(),
-            fallback_index=-10
-        )
+        one_liner = lineup_data[1]
         stats_1 = self.calculate_stats(one_liner, position=1)
         total_lines = one_liner.get('additions', 0) + one_liner.get('deletions', 0)
+        catchphrase_1 = self.catchphrases.get(1, f"{total_lines}行で世界を変える男")
         output.append(f"### 1番（二）「{one_liner['title'][:40]}」")
         output.append(self.format_pr_link(one_liner))
         output.append(f"- 変更量 +{one_liner.get('additions', 0)}-{one_liner.get('deletions', 0)} ← これだけで仕事してて草")
         output.append(f"- 打率{stats_1['batting_avg']:.3f} 出塁率{stats_1['obp']:.3f}")
-        output.append(f"- **「{total_lines}行で世界を変える男」**\n")
+        output.append(f"- **「{catchphrase_1}」**\n")
 
         # 2番: バグ修正職人
-        craftsman = next(
-            (pr for pr in self.categories['bug_fixes'] if pr['weight'] < 500),
-            self.categories['bug_fixes'][0] if self.categories['bug_fixes'] else self.sorted_prs[100]
-        )
+        craftsman = lineup_data[2]
         stats_2 = self.calculate_stats(craftsman, position=2)
+        catchphrase_2 = self.catchphrases.get(2, "エラーを見たら黙ってない男")
         output.append(f"### 2番（遊）「{craftsman['title'][:40]}」")
         output.append(self.format_pr_link(craftsman))
         output.append("- エラー処理の鬼")
         output.append(f"- 打率{stats_2['batting_avg']:.3f} 守備率{stats_2['fielding']:.3f}")
-        output.append("- **「エラーを見たら黙ってない男」**\n")
+        output.append(f"- **「{catchphrase_2}」**\n")
 
         # 3番: UI系や大型機能
-        ui_pr = self.find_pr_by_criteria(
-            lambda pr: '直感' in pr['title'] or 'ui' in pr['title'].lower(),
-            fallback_index=5
-        )
+        ui_pr = lineup_data[3]
         stats_3 = self.calculate_stats(ui_pr, position=3)
+        catchphrase_3 = self.catchphrases.get(3, "チャンスに強い中距離砲")
         output.append(f"### 3番（右）「{ui_pr['title'][:40]}」")
         output.append(self.format_pr_link(ui_pr))
         output.append(f"- 変更量 +{ui_pr.get('additions', 0)}-{ui_pr.get('deletions', 0)} files:{ui_pr.get('changedFiles', 0)}")
         output.append(f"- 打率{stats_3['batting_avg']:.3f} 長打率{stats_3['slugging']:.3f}")
-        output.append("- **「チャンスに強い中距離砲」**\n")
+        output.append(f"- **「{catchphrase_3}」**\n")
 
         # 4番: 最大のPR
-        cleanup_pr = self.sorted_prs[0]
+        cleanup_pr = lineup_data[4]
         stats_4 = self.calculate_stats(cleanup_pr, position=4)
+        catchphrase_4 = self.catchphrases.get(4, "圧倒的破壊力、リポジトリの四番打者")
         output.append(f"### 4番（一）「{cleanup_pr['title'][:40]}」")
         output.append(self.format_pr_link(cleanup_pr))
         output.append(f"- 変更量 +{cleanup_pr.get('additions', 0)}-{cleanup_pr.get('deletions', 0)} ← ファッ！？")
         output.append(f"- 打率{stats_4['batting_avg']:.3f} 本塁打{stats_4['home_runs']}本 OPS{stats_4['ops']:.3f}")
-        output.append("- **「圧倒的破壊力、リポジトリの四番打者」**\n")
+        output.append(f"- **「{catchphrase_4}」**\n")
 
         # 5番: 2番目に大きいPR
-        power_pr = self.sorted_prs[1] if len(self.sorted_prs) > 1 else self.sorted_prs[0]
+        power_pr = lineup_data[5]
         stats_5 = self.calculate_stats(power_pr, position=5)
+        catchphrase_5 = self.catchphrases.get(5, "四番の後ろを任せられる男")
         output.append(f"### 5番（左）「{power_pr['title'][:40]}」")
         output.append(self.format_pr_link(power_pr))
         output.append(f"- 変更 {power_pr.get('changedFiles', 0)}ファイル ← 暴れすぎやろ...")
         output.append(f"- 打率{stats_5['batting_avg']:.3f} 本塁打{stats_5['home_runs']}本")
-        output.append("- **「四番の後ろを任せられる男」**\n")
+        output.append(f"- **「{catchphrase_5}」**\n")
 
         # 6番: マージ職人
-        if self.categories['merge_prs']:
-            merge_pr = self.categories['merge_prs'][0]
-        else:
-            merge_pr = self.sorted_prs[10] if len(self.sorted_prs) > 10 else self.sorted_prs[0]
+        merge_pr = lineup_data[6]
         stats_6 = self.calculate_stats(merge_pr, position=6)
+        catchphrase_6 = self.catchphrases.get(6, "つなぐ野球の申し子")
         output.append(f"### 6番（三）「{merge_pr['title'][:40]}」")
         output.append(self.format_pr_link(merge_pr))
         output.append("- コンフリクト解決数∞ ← 縁の下の力持ち")
         output.append(f"- 打率{stats_6['batting_avg']:.3f} 得点圏打率{stats_6['clutch_avg']:.3f}")
-        output.append("- **「つなぐ野球の申し子」**\n")
+        output.append(f"- **「{catchphrase_6}」**\n")
 
         # 7番: 地味な改善
-        minor_pr = self.find_pr_by_criteria(
-            lambda pr: ('update' in pr['title'].lower() or 'improve' in pr['title'].lower())
-                      and 50 <= self.sorted_prs.index(pr) < 150,
-            fallback_index=75
-        )
+        minor_pr = lineup_data[7]
         stats_7 = self.calculate_stats(minor_pr, position=7)
+        catchphrase_7 = self.catchphrases.get(7, "地味だが堅実な仕事人")
         output.append(f"### 7番（捕）「{minor_pr['title'][:40]}」")
         output.append(self.format_pr_link(minor_pr))
         output.append(f"- 変更量 +{minor_pr.get('additions', 0)}-{minor_pr.get('deletions', 0)}")
         output.append(f"- 打率{stats_7['batting_avg']:.3f} 守備の要")
-        output.append("- **「地味だが堅実な仕事人」**\n")
+        output.append(f"- **「{catchphrase_7}」**\n")
 
         # 8番: Bot枠
-        if self.categories['devin_prs']:
-            bot_pr = self.categories['devin_prs'][0]
-        elif self.categories['bot_prs']:
-            bot_pr = self.categories['bot_prs'][0]
-        else:
-            bot_pr = self.sorted_prs[-5] if len(self.sorted_prs) > 5 else self.sorted_prs[0]
+        bot_pr = lineup_data[8]
         stats_8 = self.calculate_stats(bot_pr, position=8)
+        catchphrase_8 = self.catchphrases.get(8, "人間じゃないのに頑張ってる")
         output.append(f"### 8番（中）「{bot_pr['title'][:40]}」")
         output.append(self.format_pr_link(bot_pr))
         author_name = bot_pr.get('author', {}).get('login', 'unknown')
@@ -315,16 +524,17 @@ class NanJLineup:
         else:
             output.append(f"- 作者: {author_name}")
         output.append(f"- 打率{stats_8['batting_avg']:.3f}")
-        output.append("- **「人間じゃないのに頑張ってる」**\n")
+        output.append(f"- **「{catchphrase_8}」**\n")
 
         # 9番: 最弱PR
-        weakest = self.sorted_prs[-1]
+        weakest = lineup_data[9]
         stats_9 = self.calculate_stats(weakest, position=9)
+        catchphrase_9 = self.catchphrases.get(9, "でも投手だから...")
         output.append(f"### 9番（投）「{weakest['title'][:40]}」")
         output.append(self.format_pr_link(weakest))
         output.append(f"- 変更量 +{weakest.get('additions', 0)}-{weakest.get('deletions', 0)} ← しょぼすぎて泣いた")
         output.append(f"- 打率{stats_9['batting_avg']:.3f} 防御率{stats_9['era']:.2f}")
-        output.append("- **「でも投手だから...」**\n")
+        output.append(f"- **「{catchphrase_9}」**\n")
 
         return "\n".join(output)
 
@@ -377,10 +587,26 @@ class NanJLineup:
         output.append("\n---\n")
         output.append("### ベンチ入り選手（次点）")
         output.append("控えの有望株たち：")
+
+        # なんJ語のバリエーション
+        nanj_templates = [
+            "破壊力{weight:,}やんけ",
+            "パワー{weight:,}で草",
+            "{weight:,}行、これもうレギュラーやろ",
+            "実力値{weight:,}、期待の若手や",
+            "{weight:,}の仕事量、ベンチ温めとる場合か？",
+            "変更量{weight:,}で二軍落ちは草",
+            "{weight:,}行も弄って控えとか贅沢すぎやろ",
+            "ポテンシャル{weight:,}、いつでも使える便利屋や",
+        ]
+
         for i, pr in enumerate(self.sorted_prs[20:25], 1):
             if i > len(self.sorted_prs[20:]):
                 break
-            output.append(f"- {self.format_pr_link(pr)}: {pr['title'][:40]}... (重さ: {pr['weight']:,})")
+            # バリエーションから選択（PRのインデックスベースで固定）
+            template = nanj_templates[(20 + i - 1) % len(nanj_templates)]
+            comment = template.format(weight=pr['weight'])
+            output.append(f"- {self.format_pr_link(pr)}: {pr['title'][:40]}... ← {comment}")
 
         return "\n".join(output)
 
@@ -434,7 +660,11 @@ def main():
 
   ▼ 基本形式:
     gh pr list --repo <owner/repo> --state merged \\
-      --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt
+      --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName
+
+  【重要】
+  • headRepository,headRepositoryOwner を含めることで、--repo オプションが不要になります
+  • baseRefName,headRefName を含めることで、マージPR（リリース等）を自動除外できます
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -442,17 +672,17 @@ def main():
 
   # 直近100件のマージ済みPRを取得
   gh pr list --repo username/reponame --state merged --limit 100 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_100.json
 
   # 直近500件
   gh pr list --repo username/reponame --state merged --limit 500 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_500.json
 
   # 直近1000件（上限に注意）
   gh pr list --repo username/reponame --state merged --limit 1000 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_latest_1000.json
 
 ■ 年度別のPR取得
@@ -460,13 +690,13 @@ def main():
   # 2025年のPR
   gh pr list --repo username/reponame --state merged --limit 1000 \\
     --search "merged:2025-01-01..2025-12-31" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2025.json
 
   # 2024年のPR
   gh pr list --repo username/reponame --state merged --limit 1000 \\
     --search "merged:2024-01-01..2024-12-31" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024.json
 
 ■ 四半期別のPR取得
@@ -474,25 +704,25 @@ def main():
   # 2024年Q4（10-12月）
   gh pr list --repo username/reponame --state merged --limit 500 \\
     --search "merged:2024-10-01..2024-12-31" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q4.json
 
   # 2024年Q3（7-9月）
   gh pr list --repo username/reponame --state merged --limit 500 \\
     --search "merged:2024-07-01..2024-09-30" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q3.json
 
   # 2024年Q2（4-6月）
   gh pr list --repo username/reponame --state merged --limit 500 \\
     --search "merged:2024-04-01..2024-06-30" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q2.json
 
   # 2024年Q1（1-3月）
   gh pr list --repo username/reponame --state merged --limit 500 \\
     --search "merged:2024-01-01..2024-03-31" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_2024_q1.json
 
 ■ 複数ファイルの結合（大量PR取得時）
@@ -501,35 +731,35 @@ def main():
 
   # 期間を分けて取得
   gh pr list --repo username/reponame --state merged --limit 400 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part1.json
 
   gh pr list --repo username/reponame --state merged --limit 400 \\
     --search "merged:<=2024-06-30" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part2.json
 
   gh pr list --repo username/reponame --state merged --limit 400 \\
     --search "merged:<=2024-01-01" \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_part3.json
 
   # jqを使って結合
   jq -s 'add' prs_part1.json prs_part2.json prs_part3.json > prs_all.json
 
-  # 打線を生成
+  # 打線を生成（--repo オプションは不要）
   python3 nanj.py prs_all.json --output lineup_all.md
 
 ■ 特定条件でのPR取得
 
   # 特定の作者のPR
   gh pr list --repo username/reponame --state merged --author username --limit 100 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_username.json
 
   # 特定のラベルを持つPR
   gh pr list --repo username/reponame --state merged --label "bug" --limit 100 \\
-    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt \\
+    --json number,title,additions,deletions,changedFiles,author,createdAt,mergedAt,headRepository,headRepositoryOwner,baseRefName,headRefName \\
     > prs_bugs.json
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -590,11 +820,21 @@ def main():
     parser.add_argument(
         '--repo', '-r',
         default='username/reponame',
-        help='リポジトリ名（表示用、デフォルト: username/reponame）'
+        help='リポジトリ名を明示的に指定（省略時はPRデータから自動検出）'
     )
     parser.add_argument(
         '--output', '-o',
         help='出力ファイルパス (指定しない場合は標準出力)'
+    )
+    parser.add_argument(
+        '--no-claude',
+        action='store_true',
+        help='Claude CLIを使用せず、デフォルトのキャッチフレーズを使用'
+    )
+    parser.add_argument(
+        '--include-merge-prs',
+        action='store_true',
+        help='マージPR（リリース・integration等）を除外せずに含める（デフォルトは除外）'
     )
 
     args = parser.parse_args()
@@ -605,7 +845,9 @@ def main():
         sys.exit(1)
 
     # 打線生成
-    generator = NanJLineup(args.repo)
+    use_claude = not args.no_claude
+    include_merge_prs = args.include_merge_prs
+    generator = NanJLineup(args.repo, use_claude=use_claude, include_merge_prs=include_merge_prs)
     result = generator.run(args.input_file)
 
     # 出力
